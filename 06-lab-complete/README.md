@@ -44,20 +44,20 @@ Kết hợp TẤT CẢ những gì đã học trong 1 project hoàn chỉnh.
 
 ```bash
 # 1. Setup
-cp .env.example .env
+cp .env.example .env.local
 
 # 2. Chạy với Docker Compose
 docker compose up
 
 # 3. Test
-curl http://localhost/health
+curl http://localhost:8000/health
 
-# 4. Lấy API key từ .env, test endpoint
-API_KEY=$(grep AGENT_API_KEY .env | cut -d= -f2)
+# 4. Lấy API key từ .env.local, test endpoint
+API_KEY=$(grep AGENT_API_KEY .env.local | cut -d= -f2)
 curl -H "X-API-Key: $API_KEY" \
-     -X POST http://localhost/ask \
+     -X POST http://localhost:8000/ask \
      -H "Content-Type: application/json" \
-     -d '{"question": "What is deployment?"}'
+     -d '{"user_id": "student-1", "question": "What is deployment?"}'
 ```
 
 ---

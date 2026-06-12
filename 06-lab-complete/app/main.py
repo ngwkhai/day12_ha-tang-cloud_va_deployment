@@ -20,16 +20,18 @@ import signal
 import logging
 import json
 from datetime import datetime, timezone
-from collections import defaultdict, deque
+from collections import defaultdict
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Security, Depends, Request, Response
-from fastapi.security.api_key import APIKeyHeader
+from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 
 from app.config import settings
+from app.auth import verify_api_key
+from app.rate_limiter import check_rate_limit
+from app.cost_guard import check_budget, record_usage, get_usage
 
 # Mock LLM (thay bằng OpenAI/Anthropic khi có API key)
 from utils.mock_llm import ask as llm_ask
@@ -39,7 +41,7 @@ from utils.mock_llm import ask as llm_ask
 # ─────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.DEBUG if settings.debug else logging.INFO,
-    format='{"ts":"%(asctime)s","lvl":"%(levelname)s","msg":"%(message)s"}',
+    format="%(message)s",
 )
 logger = logging.getLogger(__name__)
 
@@ -47,54 +49,66 @@ START_TIME = time.time()
 _is_ready = False
 _request_count = 0
 _error_count = 0
+_redis = None
+_memory_history: dict[str, list[dict]] = defaultdict(list)
+
 
 # ─────────────────────────────────────────────────────────
-# Simple In-memory Rate Limiter
+# Redis-backed conversation history
 # ─────────────────────────────────────────────────────────
-_rate_windows: dict[str, deque] = defaultdict(deque)
+def _redis_client():
+    global _redis
+    if not settings.redis_url:
+        return None
+    if _redis is None:
+        import redis
 
-def check_rate_limit(key: str):
-    now = time.time()
-    window = _rate_windows[key]
-    while window and window[0] < now - 60:
-        window.popleft()
-    if len(window) >= settings.rate_limit_per_minute:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {settings.rate_limit_per_minute} req/min",
-            headers={"Retry-After": "60"},
-        )
-    window.append(now)
+        _redis = redis.from_url(settings.redis_url, decode_responses=True)
+    return _redis
 
-# ─────────────────────────────────────────────────────────
-# Simple Cost Guard
-# ─────────────────────────────────────────────────────────
-_daily_cost = 0.0
-_cost_reset_day = time.strftime("%Y-%m-%d")
 
-def check_and_record_cost(input_tokens: int, output_tokens: int):
-    global _daily_cost, _cost_reset_day
-    today = time.strftime("%Y-%m-%d")
-    if today != _cost_reset_day:
-        _daily_cost = 0.0
-        _cost_reset_day = today
-    if _daily_cost >= settings.daily_budget_usd:
-        raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
-    cost = (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
-    _daily_cost += cost
+def redis_ready() -> bool:
+    try:
+        client = _redis_client()
+        return bool(client and client.ping())
+    except Exception:
+        return False
 
-# ─────────────────────────────────────────────────────────
-# Auth
-# ─────────────────────────────────────────────────────────
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-def verify_api_key(api_key: str = Security(api_key_header)) -> str:
-    if not api_key or api_key != settings.agent_api_key:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing API key. Include header: X-API-Key: <key>",
-        )
-    return api_key
+def load_history(user_id: str) -> list[dict]:
+    try:
+        client = _redis_client()
+        if client and client.ping():
+            messages = client.lrange(f"history:{user_id}", 0, -1)
+            return [json.loads(message) for message in messages]
+    except Exception:
+        pass
+    return _memory_history[user_id]
+
+
+def append_history(user_id: str, role: str, content: str) -> list[dict]:
+    message = {
+        "role": role,
+        "content": content,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        client = _redis_client()
+        if client and client.ping():
+            key = f"history:{user_id}"
+            pipe = client.pipeline()
+            pipe.rpush(key, json.dumps(message))
+            pipe.ltrim(key, -20, -1)
+            pipe.expire(key, 60 * 60 * 24 * 30)
+            pipe.execute()
+            return load_history(user_id)
+    except Exception:
+        pass
+
+    history = _memory_history[user_id]
+    history.append(message)
+    del history[:-20]
+    return history
 
 # ─────────────────────────────────────────────────────────
 # Lifespan
@@ -145,7 +159,8 @@ async def request_middleware(request: Request, call_next):
         # Security headers
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers.pop("server", None)
+        if "server" in response.headers:
+            del response.headers["server"]
         duration = round((time.time() - start) * 1000, 1)
         logger.info(json.dumps({
             "event": "request",
@@ -163,13 +178,18 @@ async def request_middleware(request: Request, call_next):
 # Models
 # ─────────────────────────────────────────────────────────
 class AskRequest(BaseModel):
+    user_id: str = Field("default", min_length=1, max_length=128,
+                         description="Stable user/session identifier")
     question: str = Field(..., min_length=1, max_length=2000,
                           description="Your question for the agent")
 
 class AskResponse(BaseModel):
+    user_id: str
     question: str
     answer: str
     model: str
+    history_count: int
+    usage: dict
     timestamp: str
 
 # ─────────────────────────────────────────────────────────
@@ -201,37 +221,56 @@ async def ask_agent(
 
     **Authentication:** Include header `X-API-Key: <your-key>`
     """
-    # Rate limit per API key
-    check_rate_limit(_key[:8])  # use first 8 chars as key bucket
+    # Rate limit and budget are keyed by user_id so this remains stateless across replicas.
+    check_rate_limit(body.user_id)
+    check_budget(body.user_id)
 
-    # Budget check
     input_tokens = len(body.question.split()) * 2
-    check_and_record_cost(input_tokens, 0)
+    append_history(body.user_id, "user", body.question)
 
     logger.info(json.dumps({
         "event": "agent_call",
         "q_len": len(body.question),
+        "user_id": body.user_id,
         "client": str(request.client.host) if request.client else "unknown",
     }))
 
     answer = llm_ask(body.question)
+    history = append_history(body.user_id, "assistant", answer)
 
     output_tokens = len(answer.split()) * 2
-    check_and_record_cost(0, output_tokens)
+    usage = record_usage(body.user_id, input_tokens, output_tokens)
 
     return AskResponse(
+        user_id=body.user_id,
         question=body.question,
         answer=answer,
         model=settings.llm_model,
+        history_count=len(history),
+        usage=usage,
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
+
+
+@app.get("/history/{user_id}", tags=["Agent"])
+def history(user_id: str, _key: str = Depends(verify_api_key)):
+    messages = load_history(user_id)
+    return {
+        "user_id": user_id,
+        "messages": messages,
+        "count": len(messages),
+        "storage": "redis" if redis_ready() else "in-memory",
+    }
 
 
 @app.get("/health", tags=["Operations"])
 def health():
     """Liveness probe. Platform restarts container if this fails."""
     status = "ok"
-    checks = {"llm": "mock" if not settings.openai_api_key else "openai"}
+    checks = {
+        "llm": "mock" if not settings.openai_api_key else "openai",
+        "redis": "ok" if redis_ready() else "unavailable",
+    }
     return {
         "status": status,
         "version": settings.app_version,
@@ -248,19 +287,20 @@ def ready():
     """Readiness probe. Load balancer stops routing here if not ready."""
     if not _is_ready:
         raise HTTPException(503, "Not ready")
-    return {"ready": True}
+    if settings.redis_url and not redis_ready():
+        raise HTTPException(503, "Redis not ready")
+    return {"ready": True, "redis": "ok" if settings.redis_url else "not configured"}
 
 
 @app.get("/metrics", tags=["Operations"])
 def metrics(_key: str = Depends(verify_api_key)):
     """Basic metrics (protected)."""
+    usage = get_usage("default")
     return {
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "total_requests": _request_count,
         "error_count": _error_count,
-        "daily_cost_usd": round(_daily_cost, 4),
-        "daily_budget_usd": settings.daily_budget_usd,
-        "budget_used_pct": round(_daily_cost / settings.daily_budget_usd * 100, 1),
+        "default_user_usage": usage,
     }
 
 
